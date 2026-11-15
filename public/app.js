@@ -1,0 +1,866 @@
+import { romanize } from "/romanize.js";
+import { downsample, encodeWav, mergeChunks, rms } from "/audio.js";
+import { safeUrl } from "/book.js";
+
+const COPY = {
+  tapToSpeak: "Tap the mic and speak",
+  listening: "Listening…",
+  thinking: "Checking the books…",
+  speaking: "Speaking. Tap to stop",
+  micLabel: "Start speaking",
+  micStop: "Stop",
+  soundOn: "Spoken replies are on",
+  soundOff: "Spoken replies are off",
+  noSpeech: "Didn't catch that. Please try again.",
+  micSilent: "Mic se koi awaaz nahi aayi. Check the right microphone is selected and not muted, or type below.",
+  micBlocked: "Microphone is blocked. Allow it in browser settings, or type below.",
+  noMic: "Voice needs Chrome or Edge. You can type below.",
+  speechFailed: "Couldn't make that out. Please type it.",
+  noMicFound: "Browser ko mic nahi mila. Open Mic check below to pick your microphone.",
+  browserSpeechOffline: "Browser speech needs internet. Use Gnani mic, or check your connection.",
+  micCheckSilent: "Is mic se koi awaaz nahi aa rahi. Pick another mic above, or check it isn't muted (Windows Settings > System > Sound > Input).",
+  micCheckWorking: "Mic is working. Speak and watch the bar.",
+  micCheckWaiting: "Speak now and watch the bar…",
+  offline: "Couldn't reach the server. Please try again.",
+  undone: "Removed",
+  undoFailed: "That couldn't be undone.",
+  appointments: "Appointments today",
+  orders: "Open orders",
+  lowStock: "Low stock",
+  wrongPin: "That PIN didn't work.",
+};
+// Entry cards are coloured by what kind of entry they are; the words still say it.
+const ENTRY_KINDS = [[/^Sale/, "sale"], [/^Expense/, "expense"], [/^Payment/, "payment"], [/^(Stock|Added stock|Updated stock)/, "stock"], [/^(Order|Appointment)/, "plan"]];
+const entryKind = (summary) => ENTRY_KINDS.find(([re]) => re.test(summary))?.[1] ?? "other";
+// Speech recognition language. The Hinglish setting listens in Hindi, which handles
+// mixed speech best; what it hears is shown in Roman letters.
+const SPEECH_LANG = { hinglish: "hi-IN", english: "en-IN" };
+// These all work in demo mode as well as with the real assistant.
+const CHIPS = ["Ramesh ko 500 udhaar diya", "300 ka kharcha", "Aaj ka hisaab", "Kitna udhaar baaki hai?"];
+
+const $ = (id) => document.getElementById(id);
+const els = {
+  log: $("log"), welcome: $("welcome"), chips: $("chips"), status: $("status"), mic: $("mic"), wave: $("console-dock"),
+  input: $("input"), send: $("send"), composer: $("composer"), sound: $("sound"), name: $("business-name"),
+};
+const inr = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2, minimumFractionDigits: 0 });
+
+const store = {
+  get(key, fallback) { try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; } },
+  set(key, value) { try { localStorage.setItem(key, value); } catch { /* preference just won't persist */ } },
+};
+
+let speechMode = store.get("speech", "hinglish") === "english" ? "english" : "hinglish";
+let soundOn = store.get("sound", "on") !== "off";
+let busy = false;
+let speaking = false;
+let listening = false;
+let voiceEngine = "browser"; // who speaks replies: Gnani Timbre, or the browser
+let listenEngine = "browser"; // who hears the owner: Gnani Prisma, or the browser's recognition
+const voiceAvailable = () => listenEngine === "gnani" || Boolean(Recognition);
+
+/* ---------- Rendering ---------- */
+
+function renderChips() {
+  els.chips.replaceChildren(...CHIPS.map((text) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "chip";
+    chip.textContent = text;
+    chip.disabled = busy;
+    chip.addEventListener("click", () => send(text));
+    return chip;
+  }));
+}
+
+function renderSpeechMode() {
+  for (const btn of document.querySelectorAll("[data-speech]")) {
+    btn.setAttribute("aria-pressed", String(btn.dataset.speech === speechMode));
+  }
+}
+
+function renderSound() {
+  const label = soundOn ? COPY.soundOn : COPY.soundOff;
+  els.sound.setAttribute("aria-pressed", String(soundOn));
+  els.sound.setAttribute("aria-label", label);
+  els.sound.title = label;
+  $("sound-waves").toggleAttribute("hidden", !soundOn);
+  $("sound-off").toggleAttribute("hidden", soundOn);
+}
+
+function renderGlance(g) {
+  $("glance-sales").textContent = inr.format(g.sales_today);
+  $("glance-expenses").textContent = inr.format(g.expenses_today);
+  $("glance-outstanding").textContent = inr.format(g.outstanding);
+  const extra = [];
+  if (g.appointments_today) extra.push(`${COPY.appointments}: ${g.appointments_today}`);
+  if (g.open_orders) extra.push(`${COPY.orders}: ${g.open_orders}`);
+  if (g.low_stock) extra.push(`${COPY.lowStock}: ${g.low_stock}`);
+  $("glance-extra").textContent = extra.join(" · ");
+  $("glance-extra").hidden = !extra.length;
+}
+
+function renderBusiness(b) {
+  if (b?.name) els.name.textContent = b.name;
+}
+
+function addMessage(role, text, className = "") {
+  els.welcome.hidden = true;
+  const el = document.createElement("div");
+  el.className = `msg msg-${role} ${className}`.trim();
+  el.textContent = romanize(text);
+  els.log.append(el);
+  scrollDown();
+  return el;
+}
+
+function addLinks(links) {
+  const safe = (links ?? []).map((l) => ({ ...l, url: safeUrl(l.url) })).filter((l) => l.url);
+  if (!safe.length) return;
+  els.welcome.hidden = true;
+  const row = document.createElement("div");
+  row.className = "entry-links";
+  for (const link of safe) {
+    const a = document.createElement("a");
+    a.className = `link-chip link-${link.kind === "whatsapp" ? "wa" : "bill"}`;
+    a.href = link.url;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.textContent = romanize(link.label);
+    row.append(a);
+  }
+  els.log.append(row);
+  scrollDown();
+}
+
+let toastTimer = 0;
+function toast(message) {
+  const t = $("toast");
+  t.textContent = message;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 2600);
+}
+
+const refreshBook = () => dispatchEvent(new CustomEvent("countr:refresh"));
+
+function addAction({ id, summary, undone_at: undoneAt }) {
+  els.welcome.hidden = true;
+  const card = document.createElement("div");
+  card.className = `entry entry-${entryKind(summary)}`;
+  card.dataset.actionId = id;
+  const label = document.createElement("span");
+  label.className = "entry-summary";
+  label.textContent = romanize(summary);
+  card.append(label);
+  if (undoneAt) {
+    card.classList.add("undone");
+  } else {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "entry-undo";
+    btn.textContent = "Undo";
+    btn.setAttribute("aria-label", `Undo: ${romanize(summary)}`);
+    btn.addEventListener("click", () => undo(id, card, btn));
+    card.append(btn);
+  }
+  els.log.append(card);
+  scrollDown();
+}
+
+function markUndone(card) {
+  card.classList.add("undone");
+  card.querySelector(".entry-undo")?.remove();
+}
+
+// Only scrolls the conversation panel, never the page around it.
+function scrollDown() {
+  els.log.scrollTop = els.log.scrollHeight;
+}
+
+function setStatus(message) {
+  if (message) els.status.textContent = message;
+  else if (listening) els.status.textContent = COPY.listening;
+  else if (busy) els.status.textContent = COPY.thinking;
+  else if (speaking) els.status.textContent = COPY.speaking;
+  else els.status.textContent = voiceAvailable() ? COPY.tapToSpeak : COPY.noMic;
+  els.mic.setAttribute("aria-label", listening || speaking ? COPY.micStop : COPY.micLabel);
+  els.wave.classList.toggle("is-live", listening || speaking);
+  // The 3D ledger, if it's running, listens for these. The assistant doesn't depend on them.
+  dispatchEvent(new CustomEvent("countr:voice", { detail: { active: listening || speaking } }));
+}
+
+function setBusy(value) {
+  busy = value;
+  els.mic.disabled = value || !voiceAvailable();
+  els.send.disabled = value;
+  for (const chip of els.chips.children) chip.disabled = value;
+  for (const btn of document.querySelectorAll("[data-try]")) btn.disabled = value;
+  setStatus();
+}
+
+/* ---------- Talking to the server ---------- */
+
+async function send(text, { spoken = false } = {}) {
+  text = text.trim();
+  if (!text || busy) return;
+  stopSpeaking();
+  addMessage("user", text);
+  setBusy(true);
+
+  let bubble = null;
+  let streamed = "";
+  const showText = (value) => {
+    bubble ??= addMessage("assistant", "");
+    bubble.textContent = romanize(value);
+    scrollDown();
+  };
+
+  let finished = false;
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (res.status === 401) return authMode === "accounts" ? showAuth() : showLock();
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+    for await (const event of readEvents(res.body)) {
+      if (event.type === "text") {
+        streamed += event.delta;
+        showText(streamed);
+      } else if (event.type === "tool") {
+        // Words written before a tool call were thinking aloud; the reply comes after.
+        bubble?.remove();
+        bubble = null;
+        streamed = "";
+      } else if (event.type === "links") {
+        bubble = null;
+        streamed = "";
+        addLinks(event.links);
+      } else if (event.type === "action") {
+        bubble = null; // text after an entry belongs below its card
+        streamed = "";
+        addAction(event.action);
+        dispatchEvent(new CustomEvent("countr:entry", { detail: { summary: romanize(event.action.summary) } }));
+      } else if (event.type === "undone") {
+        const card = els.log.querySelector(`[data-action-id="${Number(event.id)}"]`);
+        if (card) markUndone(card);
+      } else if (event.type === "done") {
+        finished = true;
+        showText(event.reply);
+        renderGlance(event.glance);
+        renderBusiness(event.business);
+        refreshBook();
+        if (spoken && soundOn) speak(event.reply);
+      } else if (event.type === "error") {
+        finished = true;
+        addMessage("assistant", event.message, "msg-error");
+        renderGlance(event.glance);
+        refreshBook();
+        if (spoken && soundOn) speak(event.message);
+      }
+    }
+    if (!finished) throw new Error("Stream ended early");
+  } catch (err) {
+    console.error(err);
+    addMessage("assistant", COPY.offline, "msg-error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function* readEvents(body) {
+  const reader = body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    buffer += value;
+    let end;
+    while ((end = buffer.indexOf("\n\n")) >= 0) {
+      const line = buffer.slice(0, end);
+      buffer = buffer.slice(end + 2);
+      if (line.startsWith("data: ")) yield JSON.parse(line.slice(6));
+    }
+  }
+}
+
+async function undo(id, card, btn) {
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/actions/${id}/undo`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error);
+    markUndone(card);
+    renderGlance(body.glance);
+    refreshBook();
+    toast(`${COPY.undone}: ${romanize(body.undone)}`);
+  } catch (err) {
+    console.error(err);
+    btn.disabled = false;
+    toast(err.message || COPY.undoFailed);
+  }
+}
+
+/* ---------- Voice ---------- */
+
+const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null;
+
+function startListening() {
+  stopSpeaking();
+  recognition = new Recognition();
+  recognition.lang = SPEECH_LANG[speechMode];
+  recognition.interimResults = true;
+  recognition.continuous = false;
+
+  let transcript = "";
+  let interimBubble = null;
+  let failure = null;
+
+  recognition.onstart = () => {
+    listening = true;
+    els.mic.setAttribute("aria-pressed", "true");
+    setStatus();
+  };
+  recognition.onresult = (event) => {
+    transcript = Array.from(event.results, (r) => r[0].transcript).join(" ").trim();
+    interimBubble ??= addMessage("user", "", "interim");
+    interimBubble.textContent = romanize(transcript);
+    scrollDown();
+  };
+  recognition.onerror = (event) => {
+    failure = event.error;
+  };
+  recognition.onend = () => {
+    listening = false;
+    recognition = null;
+    els.mic.setAttribute("aria-pressed", "false");
+    interimBubble?.remove();
+    if (transcript && (!failure || failure === "no-speech")) {
+      send(transcript, { spoken: true });
+    } else if (failure === "not-allowed" || failure === "service-not-allowed") {
+      setStatus(COPY.micBlocked);
+    } else if (failure === "aborted") {
+      setStatus();
+    } else if (failure === "audio-capture") {
+      setStatus(COPY.noMicFound);
+    } else if (failure === "network") {
+      setStatus(COPY.browserSpeechOffline);
+    } else if (failure && failure !== "no-speech") {
+      setStatus(`${COPY.speechFailed} (${failure})`);
+    } else {
+      setStatus(COPY.noSpeech);
+    }
+  };
+  try {
+    recognition.start();
+  } catch (err) {
+    console.error(err);
+    recognition = null;
+    setStatus(COPY.speechFailed);
+  }
+}
+
+/* Gnani voice: records in the browser, sends WAV through our server, which holds the key. */
+
+// Speech is anything clearly louder than the room. The bar is set from the first moments
+// of each recording, so a quiet laptop mic and a noisy shop both work.
+const CALIBRATE_MS = 400;
+const SPEECH_OVER_NOISE = 2.6;
+const MIN_SPEECH_LEVEL = 0.004;
+const MAX_SPEECH_LEVEL = 0.009;
+const SILENT_MIC_LEVEL = 0.0015; // below this the mic is muted or the wrong device
+const STOP_AFTER_SILENCE_MS = 1400;
+const GIVE_UP_WITHOUT_SPEECH_MS = 8000;
+const MAX_RECORDING_MS = 28000; // Prisma's REST limit is 30 seconds
+let recording = null;
+
+// The microphone the owner picked in Mic check; empty means the browser's default.
+let micDeviceId = store.get("micDevice", "");
+
+/**
+ * Opens the chosen microphone. Auto gain lifts quiet laptop mics; the browser's noise
+ * suppression stays off because on some built-in mic arrays it removes speech along with
+ * the noise, and Gnani copes with background noise itself.
+ */
+async function openMic() {
+  // Echo cancellation is off too: replies stop before recording starts, and on some laptop
+  // mics it also flattens the owner's voice. Auto gain stays on to lift quiet mics.
+  const audio = { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true };
+  if (micDeviceId) {
+    try {
+      return await navigator.mediaDevices.getUserMedia({ audio: { ...audio, deviceId: { exact: micDeviceId } } });
+    } catch (err) {
+      if (err.name !== "OverconstrainedError" && err.name !== "NotFoundError") throw err;
+      micDeviceId = ""; // the saved mic was unplugged; fall back to the default
+      store.set("micDevice", "");
+    }
+  }
+  return navigator.mediaDevices.getUserMedia({ audio });
+}
+
+async function startGnaniRecording() {
+  stopSpeaking();
+  const session = { chunks: [], heard: false, stopped: false };
+  recording = session;
+  listening = true;
+  els.mic.setAttribute("aria-pressed", "true");
+  setStatus();
+
+  let stream, context;
+  const cleanUp = () => {
+    stream?.getTracks().forEach((track) => track.stop());
+    context?.close().catch(() => {});
+    listening = false;
+    recording = null;
+    els.mic.setAttribute("aria-pressed", "false");
+  };
+
+  try {
+    stream = await openMic();
+    if (session.stopped) return cleanUp(); // tapped again while the permission prompt was up
+    context = new AudioContext();
+    await context.resume();
+    await context.audioWorklet.addModule("/recorder-worklet.js");
+    if (session.stopped) return cleanUp();
+  } catch (err) {
+    console.error(err);
+    cleanUp();
+    if (err.name === "NotAllowedError") return setStatus(COPY.micBlocked);
+    if (err.name === "NotFoundError" || err.name === "NotReadableError") return setStatus(COPY.noMicFound);
+    return setStatus(`${COPY.speechFailed} (${err.name})`);
+  }
+
+  const rate = context.sampleRate;
+  const startedAt = performance.now();
+  let lastSoundAt = startedAt;
+  const roomLevels = [];
+  let speechLevel = MAX_SPEECH_LEVEL;
+  let peak = 0;
+
+  session.finish = () => {
+    if (session.stopped) return;
+    session.stopped = true;
+    const { chunks, heard } = session;
+    cleanUp();
+    els.wave.style.removeProperty("--lvl");
+    console.info(`Mic: loudest ${peak.toFixed(4)}, speech bar ${speechLevel.toFixed(4)}`);
+    if (!heard && peak < SILENT_MIC_LEVEL) return setStatus(`${COPY.micSilent} (mic level ${peak.toFixed(4)})`);
+    // Anything louder than a dead mic goes to Gnani; the server raises quiet recordings.
+    upload(encodeWav(downsample(mergeChunks(chunks), rate)), peak);
+  };
+
+  const source = context.createMediaStreamSource(stream);
+  const recorder = new AudioWorkletNode(context, "recorder");
+  recorder.port.onmessage = ({ data }) => {
+    if (session.stopped) return;
+    session.chunks.push(data);
+    const now = performance.now();
+    const level = rms(data);
+    peak = Math.max(peak, level);
+    if (now - startedAt < CALIBRATE_MS) {
+      roomLevels.push(level);
+    } else if (roomLevels.length) {
+      // The quietest moments are the room; people often start talking straight away.
+      const sorted = roomLevels.sort((a, b) => a - b);
+      const room = sorted[Math.floor(sorted.length * 0.2)];
+      speechLevel = Math.min(MAX_SPEECH_LEVEL, Math.max(MIN_SPEECH_LEVEL, room * SPEECH_OVER_NOISE));
+      roomLevels.length = 0;
+    }
+    // The bars beside the mic follow your voice, so you can see it's listening.
+    els.wave.style.setProperty("--lvl", Math.min(1, level / (speechLevel * 2)).toFixed(2));
+    if (level > speechLevel && now - startedAt >= CALIBRATE_MS) {
+      session.heard = true;
+      lastSoundAt = now;
+    }
+    if ((session.heard && now - lastSoundAt > STOP_AFTER_SILENCE_MS)
+      || (!session.heard && now - startedAt > GIVE_UP_WITHOUT_SPEECH_MS)
+      || now - startedAt > MAX_RECORDING_MS) {
+      session.finish();
+    }
+  };
+  source.connect(recorder);
+}
+
+function stopGnaniRecording() {
+  if (!recording) return;
+  if (recording.finish) {
+    recording.heard = true; // the owner chose to stop, so send what we have
+    recording.finish();
+  } else {
+    recording.stopped = true; // still starting up
+  }
+}
+
+async function upload(wav, peak = 0) {
+  setBusy(true);
+  let transcript = "";
+  let problem = null;
+  try {
+    const res = await fetch(`/api/speech/transcribe?mode=${speechMode}`, {
+      method: "POST",
+      headers: { "Content-Type": "audio/wav" },
+      body: wav,
+    });
+    const body = await res.json();
+    if (!res.ok) problem = body.error ?? COPY.speechFailed;
+    else transcript = body.transcript;
+  } catch (err) {
+    console.error(err);
+    problem = COPY.offline;
+  }
+  setBusy(false);
+  if (problem) return setStatus(problem);
+  // The level tells a too-quiet mic apart from speech Gnani couldn't make out.
+  if (!transcript) return setStatus(`${COPY.noSpeech} (mic level ${peak.toFixed(3)}${peak < 0.01 ? ", very low: open Mic check" : ""})`);
+  send(transcript, { spoken: true });
+}
+
+let speechRequest = 0; // lets a newer action cancel a reply that's still being fetched
+let playing = null;
+
+async function speak(text) {
+  if (!text) return;
+  if (voiceEngine !== "gnani") return speakWithBrowser(text);
+  const thisRequest = ++speechRequest;
+  speaking = true;
+  setStatus();
+  try {
+    const res = await fetch("/api/speech/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text.slice(0, 1500), mode: speechMode }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const url = URL.createObjectURL(await res.blob());
+    if (thisRequest !== speechRequest) return URL.revokeObjectURL(url);
+    const audio = new Audio(url);
+    playing = audio;
+    const finish = () => {
+      URL.revokeObjectURL(url);
+      if (playing !== audio) return;
+      playing = null;
+      speaking = false;
+      setStatus();
+    };
+    audio.onended = finish;
+    audio.onerror = () => {
+      finish();
+      speakWithBrowser(text);
+    };
+    await audio.play();
+  } catch (err) {
+    console.error(err);
+    // A reply should still be heard if Gnani's voice is unavailable.
+    if (thisRequest === speechRequest) speakWithBrowser(text);
+  }
+}
+
+function speakWithBrowser(text) {
+  if (!("speechSynthesis" in window) || !text) {
+    speaking = false;
+    return setStatus();
+  }
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = SPEECH_LANG[speechMode];
+  const voice = speechSynthesis.getVoices().find((v) => v.lang.replace("_", "-") === utterance.lang);
+  if (voice) utterance.voice = voice;
+  const finish = () => {
+    speaking = false;
+    setStatus();
+  };
+  utterance.onend = finish;
+  utterance.onerror = finish;
+  speaking = true;
+  setStatus();
+  speechSynthesis.speak(utterance);
+}
+
+function stopSpeaking() {
+  speechRequest++;
+  if (playing) {
+    playing.pause();
+    playing = null;
+  }
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  speaking = false;
+}
+
+/** The line under the mic: who is listening and speaking, with a switch when both mics exist. */
+function renderVoiceEngine() {
+  const line = $("voice-engine");
+  const hearing = listenEngine === "gnani" ? "Mic: Gnani Prisma" : "Mic: your browser";
+  const speakingBy = voiceEngine === "gnani" ? "Voice: Gnani Timbre" : "Voice: your browser";
+  line.replaceChildren(`${hearing} · ${speakingBy}`);
+  if (voiceEngine === "gnani" && Recognition) {
+    const swap = document.createElement("button");
+    swap.type = "button";
+    swap.className = "engine-switch";
+    swap.textContent = listenEngine === "gnani" ? "Use browser mic instead" : "Use Gnani mic";
+    swap.addEventListener("click", () => {
+      if (listening) return;
+      listenEngine = listenEngine === "gnani" ? "browser" : "gnani";
+      store.set("listen", listenEngine);
+      renderVoiceEngine();
+      setStatus();
+    });
+    line.append(" · ", swap);
+  }
+  if (navigator.mediaDevices?.getUserMedia) {
+    const check = document.createElement("button");
+    check.type = "button";
+    check.className = "engine-switch";
+    check.textContent = "Mic check";
+    check.addEventListener("click", openMicCheck);
+    line.append(" · ", check);
+  }
+}
+
+/* ---------- Mic check: pick the microphone and see its level live ---------- */
+
+let micCheck = null;
+
+async function openMicCheck() {
+  if (listening) return;
+  stopSpeaking();
+  $("mic-check").hidden = false;
+  await startMicCheck();
+}
+
+function closeMicCheck() {
+  stopMicCheck();
+  $("mic-check").hidden = true;
+  setStatus();
+}
+
+function stopMicCheck() {
+  if (!micCheck) return;
+  cancelAnimationFrame(micCheck.frame);
+  micCheck.stream.getTracks().forEach((t) => t.stop());
+  micCheck.context.close().catch(() => {});
+  micCheck = null;
+}
+
+async function startMicCheck() {
+  stopMicCheck();
+  const status = $("mic-check-status");
+  const bar = $("mic-check-bar");
+  bar.style.width = "0%";
+  status.textContent = COPY.micCheckWaiting;
+  status.className = "mic-check-status";
+  let stream;
+  try {
+    stream = await openMic();
+  } catch (err) {
+    status.textContent = err.name === "NotAllowedError" ? COPY.micBlocked : `${COPY.noMicFound} (${err.name})`;
+    status.className = "mic-check-status is-bad";
+    return;
+  }
+  // Device names are only visible once the browser has mic permission, so list them now.
+  const devices = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "audioinput");
+  const active = stream.getAudioTracks()[0]?.getSettings().deviceId ?? "";
+  const select = $("mic-check-device");
+  select.replaceChildren(...devices.map((d, i) => Object.assign(document.createElement("option"), {
+    value: d.deviceId, textContent: d.label || `Microphone ${i + 1}`, selected: d.deviceId === (micDeviceId || active),
+  })));
+  $("mic-check-name").textContent = stream.getAudioTracks()[0]?.label || "Default microphone";
+
+  const context = new AudioContext();
+  await context.resume();
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 2048;
+  context.createMediaStreamSource(stream).connect(analyser);
+  const data = new Float32Array(analyser.fftSize);
+  const started = performance.now();
+  let loudest = 0;
+  micCheck = { stream, context, frame: 0 };
+  const tick = () => {
+    analyser.getFloatTimeDomainData(data);
+    let sum = 0;
+    for (const v of data) sum += v * v;
+    const level = Math.sqrt(sum / data.length);
+    loudest = Math.max(loudest, level);
+    bar.style.width = `${Math.min(100, Math.sqrt(level / 0.12) * 100).toFixed(0)}%`;
+    const elapsed = performance.now() - started;
+    if (loudest > 0.01) {
+      status.textContent = COPY.micCheckWorking;
+      status.className = "mic-check-status is-good";
+    } else if (elapsed > 3500 && loudest < 0.0015) {
+      status.textContent = COPY.micCheckSilent;
+      status.className = "mic-check-status is-bad";
+    }
+    micCheck.frame = requestAnimationFrame(tick);
+  };
+  tick();
+}
+
+$("mic-check-device").addEventListener("change", (event) => {
+  micDeviceId = event.target.value;
+  store.set("micDevice", micDeviceId);
+  startMicCheck();
+});
+$("mic-check-close").addEventListener("click", closeMicCheck);
+
+/* ---------- Wiring ---------- */
+
+els.mic.addEventListener("click", () => {
+  if (listening) {
+    if (listenEngine === "gnani") stopGnaniRecording();
+    else recognition?.stop();
+  } else if (speaking) {
+    stopSpeaking();
+    setStatus();
+  } else if (listenEngine === "gnani") {
+    startGnaniRecording();
+  } else {
+    startListening();
+  }
+});
+
+els.composer.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const text = els.input.value;
+  if (!text.trim() || busy) return;
+  els.input.value = "";
+  send(text);
+});
+
+els.sound.addEventListener("click", () => {
+  soundOn = !soundOn;
+  store.set("sound", soundOn ? "on" : "off");
+  if (!soundOn) { stopSpeaking(); setStatus(); }
+  renderSound();
+});
+
+for (const btn of document.querySelectorAll("[data-speech]")) {
+  btn.addEventListener("click", () => {
+    speechMode = btn.dataset.speech;
+    store.set("speech", speechMode);
+    renderSpeechMode();
+  });
+}
+
+// "Try this" buttons around the page send their phrase to the live assistant.
+for (const btn of document.querySelectorAll("[data-try]")) {
+  btn.addEventListener("click", () => {
+    const smooth = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+    $("try").scrollIntoView({ behavior: smooth ? "smooth" : "auto", block: "center" });
+    send(btn.dataset.try);
+  });
+}
+
+// The shop book's "Try" buttons and anything else on the page can ask the assistant something.
+addEventListener("countr:say", (event) => {
+  const smooth = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+  $("try").scrollIntoView({ behavior: smooth ? "smooth" : "auto", block: "center" });
+  send(event.detail.text);
+});
+addEventListener("countr:business", (event) => renderBusiness(event.detail));
+
+// "/" jumps to the message box, like many chat apps.
+addEventListener("keydown", (event) => {
+  if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.target.closest?.("input, textarea, [contenteditable]")) return;
+  event.preventDefault();
+  els.input.focus();
+});
+
+/* ---------- PIN lock ---------- */
+
+function showLock() {
+  setBusy(false);
+  $("lock-screen").hidden = false;
+  document.body.classList.add("is-locked");
+  $("lock-pin").focus();
+}
+
+$("lock-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const pin = $("lock-pin").value;
+  $("lock-error").textContent = "";
+  try {
+    const res = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin }) });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || COPY.wrongPin);
+    $("lock-screen").hidden = true;
+    document.body.classList.remove("is-locked");
+    $("lock-pin").value = "";
+    init();
+  } catch (err) {
+    $("lock-error").textContent = err.message || COPY.wrongPin;
+    $("lock-pin").select();
+  }
+});
+
+/* ---------- Shop accounts ---------- */
+
+let authMode = "none";
+
+const post = (url, body) => fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+/** Signed out of an accounts setup: the sign-in page takes over. */
+function showAuth() {
+  setBusy(false);
+  location.replace("/login");
+}
+
+/** The header: the shop's name and type, and Sign out. */
+function renderAccount(account) {
+  $("app-signout").hidden = authMode !== "accounts" && authMode !== "pin";
+  if (!account) return;
+  $("app-shop-name").textContent = romanize(account.shop_name);
+  $("app-shop-meta").textContent = account.demo ? "Shared demo shop" : `Signed in as ${romanize(account.owner_name)}`;
+}
+
+async function signOut() {
+  await post("/api/logout", {}).catch(() => {});
+  location.replace(authMode === "accounts" ? "/login" : "/app");
+}
+$("app-signout").addEventListener("click", signOut);
+
+async function init() {
+  els.mic.disabled = !voiceAvailable();
+  renderChips();
+  renderSpeechMode();
+  renderSound();
+  setStatus();
+  try {
+    const res = await fetch("/api/state");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const state = await res.json();
+    authMode = state.auth ?? "none";
+    if (authMode === "accounts" && !state.signedIn) return showAuth();
+    if (state.locked) return showLock();
+    renderAccount(state.account);
+    $("demo-note").hidden = !state.demo;
+    // Gnani needs mic capture in the browser; without it, fall back to built-in speech.
+    voiceEngine = state.voice === "gnani" && navigator.mediaDevices?.getUserMedia && window.AudioWorkletNode ? "gnani" : "browser";
+    // The mic can use Gnani or the browser's own recognition; the owner can switch if one struggles.
+    listenEngine = voiceEngine === "gnani" && !(store.get("listen", "gnani") === "browser" && Recognition) ? "gnani" : "browser";
+    renderVoiceEngine();
+    setBusy(false);
+    renderBusiness(state.business);
+    renderGlance(state.glance);
+    els.log.querySelectorAll(".msg, .entry, .entry-links").forEach((node) => node.remove());
+    for (const m of state.messages) {
+      // Same order as when it happened: entry cards, then the reply about them.
+      for (const action of m.actions) addAction(action);
+      addLinks(m.links);
+      if (m.text) addMessage(m.role, m.text);
+    }
+    els.welcome.hidden = state.messages.length > 0;
+    scrollDown();
+    dispatchEvent(new CustomEvent("countr:ready", { detail: { business: state.business, pin: state.pin, auth: authMode } }));
+  } catch (err) {
+    console.error(err);
+    setStatus(COPY.offline);
+  }
+}
+
+init();
